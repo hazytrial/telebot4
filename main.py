@@ -5,6 +5,8 @@ import asyncio
 import sqlite3
 import secrets
 import string
+import json
+from collections import defaultdict
 from threading import Lock
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,8 +16,8 @@ from telegram.ext import (
 )
 
 # ================== CONFIG ==================
-BOT_TOKEN = "8207745136:AAEJ0MJNTS40yxBvYLmLbTRzjtO5QGJ7JkA"
-ADMIN_USER_ID = 8275649347
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8207745136:AAEJ0MJNTS40yxBvYLmLbTRzjtO5QGJ7JkA")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "8275649347"))
 
 MAIN_CHANNEL_ID = -1002628211220
 MAIN_CHANNEL_LINK = "https://t.me/+YEObPfKXsK1hNjU9"
@@ -31,6 +33,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ================== UPLOAD QUEUE (for bulk) ==================
+upload_queues = defaultdict(lambda: {'files': [], 'last_activity': 0})
 
 # ================== DATABASE ==================
 db_lock = Lock()
@@ -52,7 +57,7 @@ def init_db():
 
         with sqlite3.connect('file_links.db') as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS file_links
-                         (file_id TEXT PRIMARY KEY,
+                         (file_id TEXT,
                           file_type TEXT,
                           start_param TEXT UNIQUE,
                           upload_time REAL)''')
@@ -84,21 +89,40 @@ def save_file_link(file_id, file_type, start_param):
                 (file_id, file_type, start_param, now)
             )
 
+def save_bulk_link(file_list, start_param):
+    now = time.time()
+    data = json.dumps(file_list)
+    with db_lock:
+        with sqlite3.connect('file_links.db') as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO file_links (file_id, file_type, start_param, upload_time) VALUES (?, ?, ?, ?)",
+                ('BULK', data, start_param, now)
+            )
+
 def get_file_info(start_param):
     now = time.time()
-    expiry = 300 * 3600  # 300 hours in seconds
+    expiry = 300 * 3600  # 300 hours
     with db_lock:
         with sqlite3.connect('file_links.db') as conn:
             row = conn.execute(
                 "SELECT file_id, file_type, upload_time FROM file_links WHERE start_param = ?", (start_param,)
             ).fetchone()
-            if row:
-                file_id, file_type, upload_time = row
-                if now - upload_time > expiry:
-                    conn.execute("DELETE FROM file_links WHERE start_param = ?", (start_param,))
+            if not row:
+                return None
+
+            file_id, file_type, upload_time = row
+            if now - upload_time > expiry:
+                conn.execute("DELETE FROM file_links WHERE start_param = ?", (start_param,))
+                return None
+
+            if file_id == 'BULK':
+                try:
+                    files = json.loads(file_type)
+                    return ('BULK', files)
+                except:
                     return None
+            else:
                 return (file_id, file_type)
-            return None
 
 def get_all_users(include_banned=False):
     with db_lock:
@@ -137,52 +161,117 @@ async def start(update: Update, context: CallbackContext):
         return
     save_user(user_id)
 
-    if not context.args:
-        if is_admin(user_id):
+    if context.args:
+        start_param = context.args[0]
+        file_info = get_file_info(start_param)
+        if not file_info:
+            await update.message.reply_text("❌ Invalid or expired link.")
+            return
+
+        unjoined = await get_unjoined_channels(user_id, context)
+        if unjoined:
+            keyboard = [[InlineKeyboardButton(name, url=link)] for name, link in unjoined]
+            keyboard.append([InlineKeyboardButton("✅ Verify Access", callback_data=f"verify_{start_param}")])
             await update.message.reply_text(
-                "👑 *Admin Panel*\n\n📤 Send any file to generate a secure shareable link.",
+                "🔐 *Join the following to access this file:*",
+                reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
+            return
+
+        # Deliver file(s)
+        if file_info[0] == 'BULK':
+            files = file_info[1]
+            await update.message.reply_text("📦 Delivering bundled files...")
+            for fid, ftype in files:
+                send_method = {
+                    'photo': context.bot.send_photo,
+                    'video': context.bot.send_video,
+                    'document': context.bot.send_document,
+                    'audio': context.bot.send_audio,
+                    'voice': context.bot.send_voice,
+                }.get(ftype, context.bot.send_document)
+                try:
+                    await send_method(chat_id=user_id, document=fid)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.error(f"Bulk delivery error: {e}")
         else:
-            await update.message.reply_text(
-                "🔐 *Restricted Access*\n\n"
-                "This bot delivers files via admin-generated links only.\n"
-                "You cannot use it freely.",
-                parse_mode='Markdown'
-            )
+            file_id, file_type = file_info
+            send_method = {
+                'photo': update.message.reply_photo,
+                'video': update.message.reply_video,
+                'document': update.message.reply_document,
+                'audio': update.message.reply_audio,
+                'voice': update.message.reply_voice,
+            }.get(file_type, update.message.reply_document)
+            try:
+                await send_method(file_id)
+            except Exception as e:
+                await update.message.reply_text("❌ File unavailable.")
         return
 
-    start_param = context.args[0]
-    file_info = get_file_info(start_param)
-    if not file_info:
-        await update.message.reply_text("❌ Invalid or expired link.")
-        return
-
-    unjoined = await get_unjoined_channels(user_id, context)
-    if unjoined:
-        keyboard = [[InlineKeyboardButton(name, url=link)] for name, link in unjoined]
-        keyboard.append([InlineKeyboardButton("✅ Verify Access", callback_data=f"verify_{start_param}")])
+    # Admin main menu
+    if is_admin(user_id):
+        keyboard = [
+            [
+                InlineKeyboardButton("📤 Store Single", callback_data="menu_single"),
+                InlineKeyboardButton("📦 Store Bulk", callback_data="menu_bulk")
+            ],
+            [
+                InlineKeyboardButton("📢 Broadcast", callback_data="menu_broadcast"),
+                InlineKeyboardButton("🚫 Ban / Unban", callback_data="menu_ban")
+            ]
+        ]
         await update.message.reply_text(
-            "🔐 *Join the following to access this file:*",
+            "👑 *Hazy Admin Panel*\n\nChoose an action below:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
         return
 
-    file_id, file_type = file_info
-    send_method = {
-        'photo': update.message.reply_photo,
-        'video': update.message.reply_video,
-        'document': update.message.reply_document,
-        'audio': update.message.reply_audio,
-        'voice': update.message.reply_voice,
-    }.get(file_type, update.message.reply_document)
+    # Non-admin without link
+    await update.message.reply_text(
+        "🔐 This bot delivers files via admin-generated links only.",
+        parse_mode='Markdown'
+    )
 
-    try:
-        await send_method(file_id)
-    except Exception as e:
-        logger.error(f"File delivery error: {e}")
-        await update.message.reply_text("❌ File unavailable.")
+async def handle_admin_menu(update: Update, context: CallbackContext):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ Access denied.")
+        return
+
+    action = query.data
+    if action == "menu_single":
+        await query.edit_message_text(
+            "📤 *Store Single File*\n\nSend any file (photo, video, document, etc.) to generate a secure shareable link.",
+            parse_mode='Markdown'
+        )
+    elif action == "menu_bulk":
+        count = len(upload_queues[user_id]['files'])
+        await query.edit_message_text(
+            f"📦 *Bulk Upload Mode*\n\n✅ {count} file(s) queued.\n\n"
+            "📥 Send more files to add them.\n"
+            "⏹️ When done, use /store to generate a single link.",
+            parse_mode='Markdown'
+        )
+    elif action == "menu_broadcast":
+        await query.edit_message_text(
+            "📢 *Broadcast Tool*\n\nReply to any message with /broadcast to send it to all active users.",
+            parse_mode='Markdown'
+        )
+    elif action == "menu_ban":
+        await query.edit_message_text(
+            "🚫 *User Management*\n\nUse these commands:\n"
+            "• `/ban <user_id>` – Block user\n"
+            "• `/unban <user_id>` – Unblock\n"
+            "• `/list_banned` – View banned list\n"
+            "• `/getid` – Get your Telegram ID",
+            parse_mode='Markdown'
+        )
 
 async def handle_verification(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -209,21 +298,39 @@ async def handle_verification(update: Update, context: CallbackContext):
         )
         return
 
-    file_id, file_type = file_info
-    send_method = {
-        'photo': context.bot.send_photo,
-        'video': context.bot.send_video,
-        'document': context.bot.send_document,
-        'audio': context.bot.send_audio,
-        'voice': context.bot.send_voice,
-    }.get(file_type, context.bot.send_document)
-
-    try:
-        await send_method(chat_id=user_id, document=file_id)
-        await query.edit_message_text("✅ *File delivered!*", parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Callback send error: {e}")
-        await query.edit_message_text("❌ Failed to send file.")
+    # Deliver
+    if file_info[0] == 'BULK':
+        files = file_info[1]
+        await context.bot.send_message(user_id, "📦 Delivering bundled files...")
+        for fid, ftype in files:
+            send_method = {
+                'photo': context.bot.send_photo,
+                'video': context.bot.send_video,
+                'document': context.bot.send_document,
+                'audio': context.bot.send_audio,
+                'voice': context.bot.send_voice,
+            }.get(ftype, context.bot.send_document)
+            try:
+                await send_method(chat_id=user_id, document=fid)
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Bulk delivery error: {e}")
+        await query.edit_message_text("✅ *All files delivered!*", parse_mode='Markdown')
+    else:
+        file_id, file_type = file_info
+        send_method = {
+            'photo': context.bot.send_photo,
+            'video': context.bot.send_video,
+            'document': context.bot.send_document,
+            'audio': context.bot.send_audio,
+            'voice': context.bot.send_voice,
+        }.get(file_type, context.bot.send_document)
+        try:
+            await send_method(chat_id=user_id, document=file_id)
+            await query.edit_message_text("✅ *File delivered!*", parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Callback send error: {e}")
+            await query.edit_message_text("❌ Failed to send file.")
 
 async def handle_file(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
@@ -251,15 +358,37 @@ async def handle_file(update: Update, context: CallbackContext):
         await msg.reply_text("⚠️ Unsupported file type.")
         return
 
-    loading = await msg.reply_text("⏳ Processing...")
-    param = generate_start_param()
-    save_file_link(file_id, file_type, param)
-    link = f"https://t.me/{BOT_USERNAME}?start={param}"
+    upload_queues[user_id]['files'].append((file_id, file_type))
+    upload_queues[user_id]['last_activity'] = time.time()
 
-    await loading.edit_text(
-        f"✅ *Secure Link Generated!*\n\n"
+    count = len(upload_queues[user_id]['files'])
+    await msg.reply_text(
+        f"📥 File queued ({count} total).\n"
+        f"Send more files or use /store to generate a single link.",
+        parse_mode='Markdown'
+    )
+
+async def store_bulk(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    queue = upload_queues.get(user_id)
+    if not queue or not queue['files']:
+        await update.message.reply_text("📭 No files queued. Send files first.")
+        return
+
+    files = queue['files']
+    param = generate_start_param()
+    save_bulk_link(files, param)
+    del upload_queues[user_id]
+
+    link = f"https://t.me/{BOT_USERNAME}?start={param}"
+    await update.message.reply_text(
+        f"📦 *Bulk Link Generated!*\n\n"
+        f"📁 {len(files)} files bundled\n"
         f"🔗 `{link}`\n\n"
-        f"📤 Share this link with users.",
+        f"📤 Share this single link with users!",
         parse_mode='Markdown'
     )
 
@@ -302,7 +431,7 @@ async def broadcast(update: Update, context: CallbackContext):
             await progress.edit_text(f"📢 {i}/{len(users)} • ✅ {success} • ❌ {failed}")
         await asyncio.sleep(0.05)
 
-    await progress.edit_text(f"✅ Done!\n✅ {success} | ❌ {failed}")
+    await progress.edit_text(f"✅ Broadcast completed!\n✅ {success} | ❌ {failed}")
 
 async def stats(update: Update, context: CallbackContext):
     if not is_admin(update.effective_user.id):
@@ -313,10 +442,10 @@ async def stats(update: Update, context: CallbackContext):
             users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             banned = conn.execute("SELECT COUNT(*) FROM users WHERE banned = 1").fetchone()[0]
     await update.message.reply_text(
-        f"📊 *Stats*\n\n"
+        f"📊 *Bot Stats*\n\n"
         f"👥 Total Users: {users}\n"
         f"🚫 Banned: {banned}\n"
-        f"📁 Files: {files}",
+        f"📁 Files Stored: {files}",
         parse_mode='Markdown'
     )
 
@@ -393,7 +522,6 @@ def run_web():
     port = int(os.environ.get('PORT', 10000))
     app_web.run(host='0.0.0.0', port=port)
 
-# Start health server in background
 threading.Thread(target=run_web, daemon=True).start()
 
 # ================== MAIN ==================
@@ -403,22 +531,26 @@ def main():
 
     # Core handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("store", store_bulk))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("ban", ban_user))
     app.add_handler(CommandHandler("unban", unban_user))
     app.add_handler(CommandHandler("list_banned", list_banned))
     app.add_handler(CommandHandler("getid", getid))
+    
+    app.add_handler(CallbackQueryHandler(handle_admin_menu, pattern=r"^menu_"))
     app.add_handler(CallbackQueryHandler(handle_verification, pattern=r"^verify_"))
+    
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
         handle_file
     ))
-
-    # Block all other messages
+    
     app.add_handler(MessageHandler(filters.ALL, block_non_admin))
 
-    logger.info("🚀 Bot + Health Server started")
+    logger.info("🚀 Hazy File Bot + Health Server started")
+    print("✅ Bot is running... (Python 3.11.9 | PTB 21.7)")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
