@@ -1,7 +1,7 @@
 """
 Marshal/PYC Converter Telegram Bot
 Supports Python 3.6 - 3.13
-Author: KhanhNguyen9872
+Author: Hazy
 """
 
 import os
@@ -76,7 +76,7 @@ def convert_pyc_to_marshal(data, filename):
             code_obj = marshal.loads(data[i:])
             if "<code object <module> at " in str(code_obj):
                 marshal_code = data[i:]
-                output = f"# Marshal/PYC by KhanhNguyen9872\n"
+                output = f"# Marshal/PYC by Hazy\n"
                 output += f"# File name: [{filename}] (PYC -> Marshal)\n\n"
                 output += f"exec(__import__('marshal').loads({marshal_code!r}),globals())"
                 return output, f"{os.path.splitext(filename)[0]}_marshal.py"
@@ -94,14 +94,14 @@ def convert_marshal_to_pyc(data, filename):
     
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create hook file
-        hook_path = os.path.join(tmpdir, 'khanhnguyen9872.py')
+        hook_path = os.path.join(tmpdir, 'Hazy.py')
         hook_code = '''
 if __name__=='__main__':
     try:__import__('os').unlink(__import__('sys').argv[0])
     except:pass
     try:__import__('os').unlink(__file__)
     except:pass
-    try:__import__('os').unlink('khanhnguyen9872.py')
+    try:__import__('os').unlink('Hazy.py')
     except:pass
     __import__('sys').exit()
 import marshal
@@ -111,7 +111,7 @@ def loads(code,c="",b="",a=""):
     __import__('sys').exit(0)
 '''
         
-        compiled = compile(hook_code, '<KhanhNguyen9872>', 'exec')
+        compiled = compile(hook_code, '<Hazy>', 'exec')
         hook_bytes = base64.b64encode(zlib.compress(marshal.dumps(compiled)))[::-1]
         
         with open(hook_path, 'w') as f:
@@ -120,16 +120,16 @@ def loads(code,c="",b="",a=""):
         # Create execution code
         exec_code = b'''
 try:
-    import khanhnguyen9872
-    khanhnguyen9872.__spec__ = __import__('marshal').__spec__
-    __import__('sys').modules['marshal']=__import__('sys').modules['khanhnguyen9872']
+    import Hazy
+    Hazy.__spec__ = __import__('marshal').__spec__
+    __import__('sys').modules['marshal']=__import__('sys').modules['Hazy']
     __import__('marshal').loads.__module__ = 'marshal'
 except:
     __import__('sys').exit(1)
 
 ''' + data
         
-        compiled_exec = compile(exec_code, '<KhanhNguyen9872>', 'exec')
+        compiled_exec = compile(exec_code, '<Hazy>', 'exec')
         exec_bytes = base64.b64encode(zlib.compress(marshal.dumps(compiled_exec)))[::-1]
         
         temp_code_path = os.path.join(tmpdir, 'temp_code.py')
@@ -184,7 +184,6 @@ Send file → Auto-detect format → Receive converted file
 
 *Limits:* 50MB max, 15s timeout
 
-Issues? Ensure file is valid Python bytecode.
 """
     await update.message.reply_text(help_msg, parse_mode='Markdown')
 
@@ -196,8 +195,8 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 *Runtime:* Python {pyver}
 *Library:* python-telegram-bot 21.7
-*Author:* KhanhNguyen9872
-*Status:* ✅ Online 24/7
+*Author:* Hazy
+*Status:* Online
 """
     await update.message.reply_text(info_msg, parse_mode='Markdown')
 
@@ -262,7 +261,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(
                     document=open(output_path, 'rb'),
                     filename=output_filename,
-                    caption="✅ Converted: Marshal → PYC"
+                    caption="✅ Converted: Marshal → PYC\n BOT BY • Hazy • @CastedSpel - @Sassor"
                 )
                 os.unlink(output_path)
             else:
