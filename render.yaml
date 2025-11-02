@@ -1,12 +1,13 @@
 services:
   - type: web
-    name: hazy-file-bot
+    name: hazy-bot
     runtime: python
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
-    envVars:
+      - key: BOT_TOKEN
+        sync: false
       - key: PORT
-        value: 10000
+        value: 8080
+    healthCheckPath: /health
