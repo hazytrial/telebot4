@@ -286,7 +286,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Start the bot"""
     # Get bot token from environment
-    TOKEN = "8551227612:AAF0qLJ9L6GJVbi8ZIA9nGxw5kxj-RXeKwY"
+    TOKEN = "8432554108:AAE7FLdJdf_1x_Nec6Z_YgvNWzPyxxI5Pyg"
     
     if not TOKEN:
         logger.error("BOT_TOKEN not found in environment variables!")
